@@ -325,6 +325,11 @@ export default function App() {
    *  tests can assert on values that would otherwise vanish into a mock. A stale
    *  closure here is exactly the bug class that shipped once already. */
   const lastBackendArgs = useRef<{ analyze?: BackendArgs; fileDiff?: BackendArgs }>({});
+  /** Bumped by every analysis. LLM passes are slow and read the backend's
+   *  last analysis when they start; a result that lands after the next analysis
+   *  describes another diff and must be dropped, or its groups (matched by id)
+   *  replace the new ones with files that are not in this diff. */
+  const analysisSeq = useRef(0);
   /** True while baseRef/headRef come from a resolved PR. The cached checkout is
    *  detached, so letting loadRepoInfo auto-detect would replace the PR's fork
    *  point and tip with the checkout's default branch and a bare HEAD. */
@@ -1071,10 +1076,12 @@ export default function App() {
   const describeGroups = useCallback(async () => {
     if (!HAS_BACKEND || !llmSettings?.metadata_enabled) return;
     setDescribing(true);
+    const seq = analysisSeq.current;
     try {
       const described = await tauriInvoke<FlowGroup[]>("describe_groups", {
         repoPath: repoPath || null,
       });
+      if (seq !== analysisSeq.current) return;
       const byId = new Map(described.map((g) => [g.id, g]));
       setAnalysis((prev) =>
         prev ? { ...prev, groups: prev.groups.map((g) => byId.get(g.id) ?? g) } : prev,
@@ -1121,6 +1128,7 @@ export default function App() {
     const path = repoPath.trim();
     if (!path) return;
     lastBackendArgs.current.analyze = { repoPath: path, base: baseRef, head: headRef };
+    const seq = ++analysisSeq.current;
     setLoading(true);
     setError(null);
     // Reset LLM state on new analysis
@@ -1171,6 +1179,7 @@ export default function App() {
         await new Promise((r) => setTimeout(r, 400));
         result = MOCK_ANALYSIS;
       }
+      if (seq !== analysisSeq.current) return;
       setAnalysis(result);
       // If analysis came with annotations already (e.g., from --annotate), load them
       if (result.annotations) {
@@ -1186,19 +1195,20 @@ export default function App() {
       // Check for cached refinement and auto-apply if found
       if (HAS_BACKEND) {
         tauriInvoke<RefinementResult | null>("get_cached_refinement", { repoPath: path || null }).then((cached) => {
-          if (cached) {
+          if (cached && seq === analysisSeq.current) {
             applyRefinementResult(cached, { fromCache: true });
           }
         }).catch(() => {});
       }
       void describeGroups();
     } catch (e) {
+      if (seq !== analysisSeq.current) return;
       setError(String(e));
       // Re-focus the repo input so user can fix the path
       repoInputRef.current?.focus();
       repoInputRef.current?.select();
     } finally {
-      setLoading(false);
+      if (seq === analysisSeq.current) setLoading(false);
     }
   }, [repoPath, baseRef, headRef, includeUncommitted, handleSelectGroup, closeActivityStream, describeGroups]);
 
@@ -1280,13 +1290,14 @@ export default function App() {
     // Demo mode gets its overview from MOCK_ANALYSIS.annotations, in the same
     // state update as the analysis itself, so nothing shifts after mount.
     if (!HAS_BACKEND || !llmSettings?.annotations_enabled || !aiAccessReady) return;
+    const seq = analysisSeq.current;
     try {
       const result = await tauriInvoke<Pass1Response>("annotate_overview", {
         repoPath: repoPath || null,
         llmProvider: resolvedPrimaryProvider,
         llmModel: resolvedPrimaryModel,
       });
-      setOverview(result);
+      if (seq === analysisSeq.current) setOverview(result);
     } catch (e) {
       // Never block on the PR blurb, but say so rather than leaving the user to
       // wonder whether it is still coming.
@@ -1422,6 +1433,7 @@ export default function App() {
     if (!analysis) return;
     setRefining(true);
     setError(null);
+    const seq = analysisSeq.current;
     try {
       if (HAS_BACKEND) {
         await runStreamingJob<RefinementResult>("start_refine_groups", {
@@ -1429,7 +1441,7 @@ export default function App() {
           llmProvider: resolvedRefinementProvider,
           llmModel: resolvedRefinementModel,
         }, (result) => {
-          applyRefinementResult(result);
+          if (seq === analysisSeq.current) applyRefinementResult(result);
         }, (jobId) => {
           refinementJobIdRef.current = jobId;
         });

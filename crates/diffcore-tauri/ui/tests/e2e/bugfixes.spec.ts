@@ -420,3 +420,61 @@ test.describe("Bugfix — Comment with Monaco selection", () => {
     expect(input.selected_code).toBe(sel!.expectedText);
   });
 });
+
+// ── Stale LLM result after re-analysis ──
+
+test.describe("Bugfix — late LLM result from a previous analysis", () => {
+  test("15 — a describe_groups answer for the old diff does not replace the new groups", async ({ page }) => {
+    const groupsFor = (file: string) => [{
+      id: "group_1", name: `${file} flow`, entrypoint: null, edges: [], risk_score: 0.1, review_order: 1,
+      files: [{ path: file, flow_position: 0, role: "Entrypoint", changes: { additions: 1, deletions: 0 }, symbols_changed: [] }],
+    }];
+    const branch = (name: string) => ({ name, is_current: false, has_upstream: false });
+    let releaseStale!: () => void;
+    const stale = new Promise<void>((resolve) => { releaseStale = resolve; });
+    let describes = 0;
+
+    await page.route("**/api/health", (route) => route.fulfill({ json: { ok: true, default_repo: "/repo" } }));
+    await page.route("**/api/invoke/*", async (route) => {
+      const cmd = route.request().url().split("/").pop();
+      const file = route.request().postDataJSON()?.base === "old-base" ? "old_only.py" : "new_only.py";
+      if (cmd === "get_repo_info") {
+        return route.fulfill({ json: {
+          current_branch: "feature", default_branch: "old-base",
+          branches: [branch("feature"), branch("old-base"), branch("new-base")],
+          worktrees: [], status: null, is_worktree: false,
+        } });
+      }
+      if (cmd === "get_llm_settings") return route.fulfill({ json: { metadata_enabled: true, provider: "claude", has_api_key: true, claude_available: true, claude_authenticated: true } });
+      if (cmd === "analyze") {
+        return route.fulfill({ json: {
+          version: "1.0.0", diff_source: { diff_type: "BranchComparison" },
+          summary: { total_files_changed: 1, total_groups: 1, languages_detected: [], frameworks_detected: [] },
+          groups: groupsFor(file), infrastructure_group: null, annotations: null,
+        } });
+      }
+      if (cmd === "describe_groups") {
+        // The first describe was started for the old-base analysis; it answers last.
+        if (++describes === 1) {
+          await stale;
+          return route.fulfill({ json: groupsFor("old_only.py") });
+        }
+        return route.fulfill({ json: groupsFor("new_only.py") });
+      }
+      return route.fulfill({ json: null });
+    });
+
+    await page.goto("/");
+    await page.getByRole("button", { name: "Analyze", exact: true }).click();
+    await expect(page.locator(".panel-left")).toContainText("old_only.py");
+    await page.getByTestId("base-branch-dropdown").locator("button").click();
+    await page.locator(".branch-option", { hasText: "new-base" }).click();
+    await expect(page.locator(".panel-left")).toContainText("new_only.py");
+    await expect.poll(() => describes).toBe(2);
+
+    releaseStale();
+    await page.waitForTimeout(500);
+    await expect(page.locator(".panel-left")).toContainText("new_only.py");
+    await expect(page.locator(".panel-left")).not.toContainText("old_only.py");
+  });
+});
