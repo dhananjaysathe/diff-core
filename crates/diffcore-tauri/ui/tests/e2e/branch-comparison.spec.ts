@@ -79,6 +79,22 @@ test.describe("Branch Comparison Dropdowns", () => {
     await expect(baseName).toHaveText("main");
   });
 
+  test("04b — base defaults to HEAD's PR base when the forge reports a stacked PR", async ({ page }) => {
+    await page.route("**/api/health", (route) => route.fulfill({ json: { ok: true, default_repo: "/repo" } }));
+    await page.route("**/api/invoke/*", (route) =>
+      route.fulfill({
+        json: route.request().url().endsWith("/get_repo_info")
+          ? makeRepoInfo({ pr_base: "origin/feature/parent-pr" })
+          : null,
+      }),
+    );
+    await page.goto("/");
+
+    await expect(page.locator("[data-testid='base-branch-dropdown'] .branch-name")).toHaveText(
+      "origin/feature/parent-pr",
+    );
+  });
+
   test("05 — clicking source dropdown opens branch list", async ({ page }) => {
     const headTrigger = page.locator("[data-testid='head-branch-dropdown'] .branch-dropdown-trigger");
     await headTrigger.click();

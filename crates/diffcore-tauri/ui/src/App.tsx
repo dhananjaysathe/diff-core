@@ -674,8 +674,8 @@ export default function App() {
       if (restoredRepo.current !== path) restoredRepo.current = null;
       if (!keepRefs) {
         refsPinned.current = false;
-        // Auto-set base ref to the detected default branch
-        setBaseRef(info.default_branch);
+        // Auto-set base ref to HEAD's PR base (stacked PRs), else the default branch
+        setBaseRef(info.pr_base ?? info.default_branch);
         // Auto-set head ref to the current branch (what we're comparing FROM)
         setHeadRef(info.current_branch ?? "HEAD");
       }

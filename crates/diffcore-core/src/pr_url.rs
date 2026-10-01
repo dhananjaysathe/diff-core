@@ -603,10 +603,18 @@ pub(crate) fn resolve_in(pr: &PrUrl, root: &Path) -> Result<ResolvedPr, PrUrlErr
     git(&dir, &["checkout", "--force", "--detach", &local_head])?;
 
     // Target-branch tip: the merge ref's first parent when the provider publishes
-    // one, otherwise reconstructed from the default branch.
+    // one, otherwise reconstructed from the PR's base branch — which for a stacked
+    // PR is another PR's head, not the default branch.
     let target = match merge_ref {
         Some(_) => format!("{local_merge}^1"),
-        None => target_from_default_branch(&dir, &local_head)?,
+        None => {
+            let head_sha = git(&dir, &["rev-parse", &local_head])?;
+            let branch = match pr_base_branch(&dir, head_sha.trim()) {
+                Some(base) => base,
+                None => default_branch(&dir)?,
+            };
+            target_from_branch(&dir, &local_head, &branch)?
+        }
     };
     // Report the fork point, not the target tip, so a plain two-dot `base..head`
     // diff equals what the provider shows under "Files changed". Abbreviated so
@@ -636,18 +644,17 @@ pub(crate) fn resolve_in(pr: &PrUrl, root: &Path) -> Result<ResolvedPr, PrUrlErr
 /// Best guess at the PR's target-branch tip when no merge ref is published.
 ///
 /// Providers drop the merge ref once a PR lands, and by then the head is an
-/// ancestor of the default branch, so `merge-base(default, head)` collapses to
+/// ancestor of the target branch, so `merge-base(target, head)` collapses to
 /// `head` and the diff comes out empty. Recover the pre-merge tip from the merge
 /// commit that landed the PR.
 ///
 /// Squash- and rebase-merges are fine: they rewrite the commit, so the head is
 /// not an ancestor and the plain merge base is already the fork point. Only
 /// fast-forward merges are unrecoverable, and `resolve` rejects those explicitly.
-fn target_from_default_branch(dir: &Path, head: &str) -> Result<String, PrUrlError> {
-    let default = default_branch(dir)?;
-    let already_merged = git(dir, &["merge-base", "--is-ancestor", head, &default]).is_ok();
+fn target_from_branch(dir: &Path, head: &str, branch: &str) -> Result<String, PrUrlError> {
+    let already_merged = git(dir, &["merge-base", "--is-ancestor", head, branch]).is_ok();
     if already_merged {
-        let range = format!("{head}..{default}");
+        let range = format!("{head}..{branch}");
         let merges = git(dir, &["rev-list", "--ancestry-path", "--merges", &range])?;
         // Oldest merge on the ancestry path is the one that landed this PR.
         if let Some(landing) = merges.split_whitespace().next_back() {
@@ -656,7 +663,39 @@ fn target_from_default_branch(dir: &Path, head: &str) -> Result<String, PrUrlErr
             }
         }
     }
-    Ok(default)
+    Ok(branch.to_string())
+}
+
+/// The base branch the forge reports for the PR whose head is `head_sha`, as a
+/// ref that exists in `dir`: the local branch of that name, else `origin/<base>`.
+///
+/// One `gh` lookup, matched on the exact head commit so it also works for local
+/// branches named `pr-N` with no tracking config. `None` (callers keep their
+/// default) without `gh`, auth, a GitHub remote, or a matching PR.
+pub fn pr_base_branch(dir: &Path, head_sha: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Pr {
+        base_ref_name: String,
+        head_ref_oid: String,
+    }
+    let out = Command::new("gh")
+        .args(["pr", "list", "--state", "all", "--search", head_sha])
+        .args(["--json", "baseRefName,headRefOid", "--limit", "20"])
+        .current_dir(dir)
+        .env("GH_PROMPT_DISABLED", "1")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let prs: Vec<Pr> = serde_json::from_slice(&out.stdout).ok()?;
+    let pr = prs.into_iter().find(|pr| pr.head_ref_oid == head_sha)?;
+    let exists = |r: &str| git(dir, &["rev-parse", "--verify", "--quiet", r]).is_ok();
+    let base = pr.base_ref_name;
+    if exists(&format!("refs/heads/{base}")) {
+        return Some(base);
+    }
+    let remote = format!("origin/{base}");
+    exists(&format!("refs/remotes/{remote}")).then_some(remote)
 }
 
 /// Resolve the remote's default branch, for providers without a merge ref.

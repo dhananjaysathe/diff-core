@@ -177,6 +177,8 @@ export interface RepoInfo {
   status: BranchStatus | null;
   /** Whether the opened path is a linked worktree (not the main worktree). */
   is_worktree: boolean;
+  /** Base branch of HEAD's PR (another PR's branch when stacked), if the forge knows. */
+  pr_base?: string | null;
 }
 
 /** A pull/merge request URL resolved to a local checkout — see `resolve_pr_url`. */

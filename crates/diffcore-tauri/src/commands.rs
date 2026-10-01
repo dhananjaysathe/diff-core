@@ -1754,6 +1754,10 @@ pub fn get_repo_info(repo_path: String) -> Result<RepoInfo, CommandError> {
     let worktrees = git::list_worktrees(&repo).map_err(|e| CommandError::Git(format!("{}", e)))?;
     let status = git::get_branch_status(&repo).ok();
     let is_worktree = git::is_linked_worktree(&repo);
+    let pr_base = match (repo.workdir(), repo.head().and_then(|h| h.peel_to_commit())) {
+        (Some(dir), Ok(head)) => pr_url::pr_base_branch(dir, &head.id().to_string()),
+        _ => None,
+    };
 
     Ok(RepoInfo {
         current_branch: current,
@@ -1762,6 +1766,7 @@ pub fn get_repo_info(repo_path: String) -> Result<RepoInfo, CommandError> {
         worktrees,
         status,
         is_worktree,
+        pr_base,
     })
 }
 
@@ -2402,6 +2407,9 @@ pub struct RepoInfo {
     pub status: Option<git::BranchStatus>,
     /// Whether the opened path is a linked worktree (not the main worktree).
     pub is_worktree: bool,
+    /// Base branch of the PR whose head is HEAD, when the forge knows one.
+    /// Stacked PRs target another PR's branch, not `default_branch`.
+    pub pr_base: Option<String>,
 }
 
 /// Open a repository from a path, with canonicalization and error handling.
@@ -3246,6 +3254,7 @@ mod tests {
                 behind: 0,
             }),
             is_worktree: false,
+            pr_base: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: RepoInfo = serde_json::from_str(&json).unwrap();
@@ -3265,6 +3274,7 @@ mod tests {
             worktrees: vec![],
             status: None,
             is_worktree: false,
+            pr_base: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: RepoInfo = serde_json::from_str(&json).unwrap();
