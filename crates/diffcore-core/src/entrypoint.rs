@@ -184,7 +184,7 @@ fn detect_http_routes(file: &ParsedFile, out: &mut Vec<Entrypoint>) {
         Language::C => detect_http_routes_c_cpp(file, out),
         Language::Cpp => detect_http_routes_c_cpp(file, out),
         Language::Scala => detect_http_routes_scala(file, out),
-        Language::Unknown => {}
+        Language::Sql | Language::Unknown => {}
     }
 }
 
@@ -1385,7 +1385,7 @@ fn has_web_framework_import_for_lang(file: &ParsedFile) -> bool {
         Language::Kotlin => is_kotlin_web_framework_import(imp),
         Language::Swift => is_swift_web_framework_import(imp),
         Language::Scala => is_scala_web_framework_import(imp),
-        Language::C | Language::Cpp | Language::Unknown => false,
+        Language::C | Language::Cpp | Language::Sql | Language::Unknown => false,
     })
 }
 

@@ -117,6 +117,12 @@ mod queries {
         pub const CALLS: &str = include_str!("../queries/scala/calls.scm");
         pub const ASSIGNMENTS: &str = include_str!("../queries/scala/assignments.scm");
     }
+    pub mod sql {
+        pub const IMPORTS: &str = include_str!("../queries/sql/imports.scm");
+        pub const DEFINITIONS: &str = include_str!("../queries/sql/definitions.scm");
+        pub const CALLS: &str = include_str!("../queries/sql/calls.scm");
+        pub const ASSIGNMENTS: &str = include_str!("../queries/sql/assignments.scm");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +264,7 @@ pub struct QueryEngine {
     c_queries: OnceCell<LanguageQueries>,
     cpp_queries: OnceCell<LanguageQueries>,
     scala_queries: OnceCell<LanguageQueries>,
+    sql_queries: OnceCell<LanguageQueries>,
 }
 
 /// Compile all `.scm` queries for a single language into a [`LanguageQueries`].
@@ -302,6 +309,7 @@ impl QueryEngine {
             c_queries: OnceCell::new(),
             cpp_queries: OnceCell::new(),
             scala_queries: OnceCell::new(),
+            sql_queries: OnceCell::new(),
         })
     }
 
@@ -545,6 +553,20 @@ impl QueryEngine {
                     )
                 })
                 .map(Some),
+            Language::Sql => self
+                .sql_queries
+                .get_or_try_init(|| {
+                    compile_queries(
+                        tree_sitter_sequel::LANGUAGE.into(),
+                        "sql",
+                        queries::sql::IMPORTS,
+                        None,
+                        queries::sql::DEFINITIONS,
+                        queries::sql::CALLS,
+                        queries::sql::ASSIGNMENTS,
+                    )
+                })
+                .map(Some),
             Language::Unknown => Ok(None),
         }
     }
@@ -568,6 +590,13 @@ impl QueryEngine {
                 parsers.insert(language, p);
             }
             let parser = parsers.get_mut(&language).unwrap();
+            let masked;
+            let source = if language == Language::Sql {
+                masked = mask_sql_bodies(source);
+                masked.as_str()
+            } else {
+                source
+            };
             parser
                 .parse(source, None)
                 .ok_or_else(|| QueryEngineError::ParseError("tree-sitter failed to parse".into()))
@@ -693,7 +722,22 @@ impl QueryEngine {
             }
         }
 
-        let call_sites = self.extract_call_sites(&root, src, &lang_queries.calls, language)?;
+        let mut call_sites = self.extract_call_sites(&root, src, &lang_queries.calls, language)?;
+        if language == Language::Sql {
+            call_sites.extend(sql_body_calls(source));
+            // Tree and text calls alike: the caller is the innermost routine
+            // (or trigger) whose span covers the call.
+            for call in &mut call_sites {
+                call.containing_function = definitions
+                    .iter()
+                    .filter(|d| {
+                        d.kind == SymbolKind::Function
+                            && (d.start_line..=d.end_line).contains(&call.line)
+                    })
+                    .max_by_key(|d| d.start_line)
+                    .map(|d| d.name.clone());
+            }
+        }
 
         Ok(ParsedFile {
             path: path.to_string(),
@@ -3012,6 +3056,35 @@ impl QueryEngine {
                     }
                 }
             }
+            Language::Sql => {
+                let sql_def_captures: &[(&str, &str, SymbolKind)] = &[
+                    ("func_name", "func_node", SymbolKind::Function),
+                    ("trigger_name", "trigger_node", SymbolKind::Function),
+                    ("table_name", "table_node", SymbolKind::Struct),
+                    ("view_name", "view_node", SymbolKind::Struct),
+                ];
+
+                for m in &matches {
+                    for &(name_cap, node_cap, kind) in sql_def_captures {
+                        let Some(name_node) = m.get_capture(qwc.capture_index(name_cap)) else {
+                            continue;
+                        };
+                        let key = (name_node.start_byte(), 0);
+                        if !seen_nodes.contains(&key) {
+                            seen_nodes.push(key);
+                            let (start_line, end_line, _) =
+                                node_span(m, qwc.capture_index(node_cap));
+                            definitions.push(Definition {
+                                name: node_text(&name_node, source).to_string(),
+                                kind,
+                                start_line,
+                                end_line,
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -3299,7 +3372,8 @@ fn find_containing_function(node: &Node, source: &[u8], language: Language) -> O
         Language::C => &["function_definition"],
         Language::Cpp => &["function_definition"],
         Language::Scala => &["function_definition", "function_declaration"],
-        Language::Unknown => return None,
+        // SQL callers are resolved by span in `parse_with_queries_from_tree`.
+        Language::Sql | Language::Unknown => return None,
     };
 
     let mut current = node.parent();
@@ -3351,6 +3425,98 @@ fn extract_arg_texts(args_node: &Node, source: &[u8], language: Language) -> Vec
         }
     }
     args
+}
+
+/// Byte ranges of the contents of dollar-quoted strings (`$$...$$`, `$tag$...$tag$`),
+/// i.e. PL/pgSQL and SQL function bodies.
+fn sql_bodies(source: &str) -> Vec<std::ops::Range<usize>> {
+    let is_tag = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut bodies = Vec::new();
+    let mut pos = 0;
+    while let Some(i) = source[pos..].find('$') {
+        let open = pos + i;
+        pos = open + 1;
+        let tag_end = source[pos..]
+            .find(|c| !is_tag(c))
+            .map_or(source.len(), |j| pos + j);
+        // `$1` is a positional parameter, not a tag.
+        if !source[tag_end..].starts_with('$')
+            || source[pos..].starts_with(|c: char| c.is_ascii_digit())
+        {
+            continue;
+        }
+        let delim = &source[open..=tag_end];
+        let body = tag_end + 1;
+        if let Some(len) = source[body..].find(delim) {
+            bodies.push(body..body + len);
+            pos = body + len + delim.len();
+        }
+    }
+    bodies
+}
+
+/// Blank dollar-quoted bodies (keeping newlines, so offsets and lines are
+/// unchanged): the grammar can't parse PL/pgSQL and one bad body swallows the
+/// rest of the file into an ERROR node. Also rewrites `PROCEDURE` to
+/// `FUNCTION ` because the grammar has no `CREATE PROCEDURE`.
+fn mask_sql_bodies(source: &str) -> String {
+    let mut bytes = source.as_bytes().to_vec();
+    for body in sql_bodies(source) {
+        for b in &mut bytes[body] {
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let lower = bytes.to_ascii_lowercase();
+    for (i, w) in lower.windows(9).enumerate() {
+        if w == b"procedure"
+            && !(i > 0 && is_word(lower[i - 1]))
+            && !lower.get(i + 9).is_some_and(|&b| is_word(b))
+        {
+            bytes[i..i + 9].copy_from_slice(b"FUNCTION ");
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| source.to_string())
+}
+
+/// ponytail: textual fallback for calls inside dollar-quoted bodies, since the
+/// grammar can't parse PL/pgSQL. Takes every `name(` / `schema.name(` outside
+/// `--` comments (covers PERFORM, SELECT fn(), CALL, dynamic EXECUTE strings).
+/// Keywords like `IF (` or `VALUES (` come out too but never resolve to a
+/// definition. Replace with a tree walk if a PL/pgSQL grammar becomes usable.
+fn sql_body_calls(source: &str) -> Vec<CallSite> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
+    let mut calls = Vec::new();
+    for body in sql_bodies(source) {
+        let first_line = source[..body.start].matches('\n').count() + 1;
+        for (offset, line) in source[body].lines().enumerate() {
+            let code = line.split("--").next().unwrap_or("").as_bytes();
+            let mut i = 0;
+            while i < code.len() {
+                let start = i;
+                while i < code.len() && is_ident(code[i]) {
+                    i += 1;
+                }
+                if i == start {
+                    i += 1;
+                    continue;
+                }
+                let name = String::from_utf8_lossy(&code[start..i]);
+                let name = name.trim_matches('.');
+                let called = code[i..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'(');
+                if called && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                    calls.push(CallSite {
+                        callee: name.to_string(),
+                        line: first_line + offset,
+                        containing_function: None,
+                    });
+                }
+            }
+        }
+    }
+    calls
 }
 
 /// Simple string hash for deduplication keys.
@@ -9095,6 +9261,73 @@ type UserId = String
             callees.contains(&"println"),
             "println call; got: {:?}",
             callees
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SQL tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sql_definitions_and_calls() {
+        let e = engine();
+        // The PL/pgSQL body (IF/PERFORM) is not valid grammar input; it must not
+        // swallow the definitions that follow it.
+        let result = e
+            .parse_file(
+                "db/functions.sql",
+                r#"CREATE OR REPLACE FUNCTION wms.do_x(q INT) RETURNS UUID AS $$
+DECLARE r UUID;
+BEGIN
+  IF q < 1 THEN RAISE EXCEPTION 'V0001'; END IF;
+  PERFORM wms._verify(q); -- wms.not_a_call(q)
+  SELECT wms._insert(q) INTO r;
+  RETURN r;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE PROCEDURE wms.do_p() LANGUAGE plpgsql AS $body$ BEGIN CALL wms.do_x(1); END $body$;
+
+CREATE TABLE wms.item (id UUID PRIMARY KEY);
+CREATE VIEW wms.item_view AS SELECT wms.label(id) FROM wms.item;
+CREATE TRIGGER on_item AFTER UPDATE ON wms.item FOR EACH ROW EXECUTE FUNCTION wms.on_item_update();
+"#,
+            )
+            .unwrap();
+        assert_eq!(result.language, Language::Sql);
+
+        let defs: Vec<(&str, SymbolKind)> = result
+            .definitions
+            .iter()
+            .map(|d| (d.name.as_str(), d.kind.clone()))
+            .collect();
+        assert_eq!(
+            defs,
+            vec![
+                ("do_x", SymbolKind::Function),
+                ("do_p", SymbolKind::Function),
+                ("item", SymbolKind::Struct),
+                ("item_view", SymbolKind::Struct),
+                ("on_item", SymbolKind::Function),
+            ]
+        );
+
+        let mut calls: Vec<(&str, Option<&str>)> = result
+            .call_sites
+            .iter()
+            .filter(|c| c.callee.starts_with("wms."))
+            .map(|c| (c.callee.as_str(), c.containing_function.as_deref()))
+            .collect();
+        calls.sort();
+        assert_eq!(
+            calls,
+            vec![
+                ("wms._insert", Some("do_x")),
+                ("wms._verify", Some("do_x")),
+                ("wms.do_x", Some("do_p")),
+                ("wms.label", None),
+                ("wms.on_item_update", Some("on_item")),
+            ]
         );
     }
 }

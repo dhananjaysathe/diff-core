@@ -36,8 +36,8 @@ expression: v
       "name": "docs (directory)",
       "review_focus": [],
       "review_order": 1,
-      "risk": "Medium",
-      "risk_score": 0.35,
+      "risk": "Low",
+      "risk_score": 0.225,
       "summary": []
     }
   ],
@@ -82,7 +82,9 @@ expression: v
   },
   "summary": {
     "frameworks_detected": [],
-    "languages_detected": [],
+    "languages_detected": [
+      "sql"
+    ],
     "total_files_changed": 8,
     "total_groups": 1
   },

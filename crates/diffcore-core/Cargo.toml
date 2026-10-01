@@ -42,6 +42,7 @@ tree-sitter-swift = "0.7.1"
 tree-sitter-c = "0.24.1"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-scala = "0.25.0"
+tree-sitter-sequel = "0.3.11"
 fastembed = { version = "4", optional = true }
 
 [features]

@@ -2299,6 +2299,7 @@ mod proptests {
                     Language::C => ".c",
                     Language::Cpp => ".cpp",
                     Language::Scala => ".scala",
+                    Language::Sql => ".sql",
                     Language::Unknown => "",
                 };
                 IrFile {

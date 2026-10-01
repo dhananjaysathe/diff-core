@@ -473,7 +473,11 @@ pub(super) fn infer_file_role(path: &str) -> FileRole {
         FileRole::Handler
     } else if lower.contains("service") {
         FileRole::Service
-    } else if lower.contains("repo") || lower.contains("repository") || lower.contains("dal") {
+    } else if lower.contains("repo")
+        || lower.contains("repository")
+        || lower.contains("dal")
+        || lower.ends_with(".sql")
+    {
         FileRole::Repository
     } else if lower.contains("model") || lower.contains("schema") || lower.contains("entity") {
         FileRole::Model

@@ -31,6 +31,7 @@ pub enum Language {
     C,
     Cpp,
     Scala,
+    Sql,
     Unknown,
 }
 
@@ -54,6 +55,7 @@ impl Language {
             "cpp" | "cc" | "cxx" | "c++" => Language::Cpp,
             "hpp" | "hxx" | "h++" | "hh" => Language::Cpp,
             "scala" | "sc" => Language::Scala,
+            "sql" => Language::Sql,
             _ => Language::Unknown,
         }
     }
@@ -165,6 +167,15 @@ pub fn parse_file(path: &str, source: &str) -> Result<ParsedFile, AstError> {
         Language::TypeScript | Language::JavaScript => parse_typescript(path, source, language),
         Language::Python => parse_python(path, source),
         Language::Go => parse_go(path, source),
+        // No hand-written SQL parser; reuse the declarative engine.
+        Language::Sql => {
+            static ENGINE: once_cell::sync::OnceCell<crate::query_engine::QueryEngine> =
+                once_cell::sync::OnceCell::new();
+            ENGINE
+                .get_or_try_init(crate::query_engine::QueryEngine::new)
+                .and_then(|engine| engine.parse_file(path, source))
+                .map_err(|e| AstError::ParseError(e.to_string()))
+        }
         Language::Rust
         | Language::Java
         | Language::CSharp
@@ -263,6 +274,7 @@ pub fn extract_data_flow_info(path: &str, source: &str) -> Result<DataFlowInfo, 
         | Language::C
         | Language::Cpp
         | Language::Scala
+        | Language::Sql
         | Language::Unknown => Ok(DataFlowInfo {
             assignments: vec![],
             calls_with_args: vec![],
