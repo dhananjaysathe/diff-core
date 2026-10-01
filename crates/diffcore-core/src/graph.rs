@@ -123,6 +123,7 @@ impl SymbolGraph {
         // Build lookup structures for import resolution.
         let file_exports = build_export_map(files);
         let file_defs = build_definition_map(files);
+        let sql_routines = build_sql_routine_map(files);
 
         // Phase 2: Compute edges per file in parallel, then add single-threaded.
         let edge_batches: Vec<Vec<(String, String, EdgeType)>> = files
@@ -143,6 +144,7 @@ impl SymbolGraph {
                     files,
                     &file_exports,
                     &file_defs,
+                    &sql_routines,
                     &id_to_index,
                     workspace_map,
                     &mut edges,
@@ -868,11 +870,13 @@ fn collect_import_edges(
 }
 
 /// Collect call edge descriptors: function A calls function B.
+#[allow(clippy::too_many_arguments)]
 fn collect_call_edges(
     file: &ParsedFile,
     all_files: &[ParsedFile],
     file_exports: &HashMap<String, Vec<ExportInfo>>,
     file_defs: &HashMap<String, Vec<Definition>>,
+    sql_routines: &HashMap<&str, String>,
     id_to_index: &HashMap<String, NodeIndex>,
     workspace_map: &WorkspaceMap,
     edges: &mut Vec<(String, String, EdgeType)>,
@@ -945,10 +949,42 @@ fn collect_call_edges(
 
         // Local function call — same file.
         let local_id = format!("{}::{}", file.path, callee_name);
-        if id_to_index.contains_key(&local_id) && resolved_caller_id != local_id {
-            edges.push((resolved_caller_id.clone(), local_id, EdgeType::Calls));
+        if id_to_index.contains_key(&local_id) {
+            if resolved_caller_id != local_id {
+                edges.push((resolved_caller_id.clone(), local_id, EdgeType::Calls));
+            }
+            continue;
+        }
+
+        // SQL routines are never imported: `wms.do_x(...)`, `func.wms.do_x(...)`
+        // and textual references resolve by bare name to the defining file.
+        let bare = callee_name.rsplit('.').next().unwrap_or(callee_name);
+        if let Some(target_id) = sql_routines.get(bare) {
+            if resolved_caller_id != *target_id {
+                edges.push((
+                    resolved_caller_id.clone(),
+                    target_id.clone(),
+                    EdgeType::Calls,
+                ));
+            }
         }
     }
+}
+
+/// Map bare SQL function/procedure/trigger name → symbol id (first file wins).
+fn build_sql_routine_map(files: &[ParsedFile]) -> HashMap<&str, String> {
+    let mut map = HashMap::new();
+    for file in files.iter().filter(|f| f.language == Language::Sql) {
+        for def in file
+            .definitions
+            .iter()
+            .filter(|d| d.kind == SymbolKind::Function)
+        {
+            map.entry(def.name.as_str())
+                .or_insert_with(|| format!("{}::{}", file.path, def.name));
+        }
+    }
+    map
 }
 
 /// Build a map from imported name → resolved symbol id for a given file.

@@ -17,14 +17,17 @@
 //!             → cluster + rank (unchanged, operate on graph/entrypoints)
 //! ```
 
+use aho_corasick::{AhoCorasick, MatchKind};
 use dashmap::DashMap;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::ast::{self, ParsedFile};
 use crate::ir::IrFile;
 use crate::query_engine::QueryEngine;
+use crate::types::SymbolKind;
 
 // ---------------------------------------------------------------------------
 // Content-addressed IrFile cache
@@ -487,7 +490,76 @@ pub fn parse_files_parallel(files: &[(&str, &str)]) -> Vec<ParsedFile> {
     // Sort by path for deterministic ordering.
     parsed.sort_by(|a, b| a.path.cmp(&b.path));
 
+    add_sql_routine_references(&mut parsed, files);
     parsed
+}
+
+/// SQL routines are reached by name from strings and query builders
+/// (`text("select do_x()")`, `func.wms.do_x`, `"do_x"`), never via imports.
+/// Every whole-word mention of a SQL routine defined in this diff becomes a
+/// call site from the enclosing function, so the graph can link the two.
+fn add_sql_routine_references(parsed: &mut [ParsedFile], files: &[(&str, &str)]) {
+    let names: BTreeSet<&str> = parsed
+        .iter()
+        .filter(|f| f.language == ast::Language::Sql)
+        .flat_map(|f| &f.definitions)
+        .filter(|d| d.kind == SymbolKind::Function)
+        .map(|d| d.name.as_str())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    let names: Vec<String> = names.into_iter().map(str::to_string).collect();
+    let Ok(matcher) = AhoCorasick::builder()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(&names)
+    else {
+        return;
+    };
+    let sources: HashMap<&str, &str> = files.iter().copied().collect();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    for file in parsed
+        .iter_mut()
+        .filter(|f| f.language != ast::Language::Sql)
+    {
+        let Some(source) = sources.get(file.path.as_str()) else {
+            continue;
+        };
+        let bytes = source.as_bytes();
+        let (mut line, mut seen) = (1, 0);
+        for m in matcher.find_iter(source) {
+            if (m.start() > 0 && is_word(bytes[m.start() - 1]))
+                || bytes.get(m.end()).is_some_and(|&b| is_word(b))
+            {
+                continue;
+            }
+            line += source[seen..m.start()].matches('\n').count();
+            seen = m.start();
+            let name = &names[m.pattern().as_usize()];
+            // Already a parsed call, e.g. `func.wms.do_x(...)`.
+            if file
+                .call_sites
+                .iter()
+                .any(|c| c.line == line && c.callee.rsplit('.').next() == Some(name))
+            {
+                continue;
+            }
+            let containing_function = file
+                .definitions
+                .iter()
+                .filter(|d| {
+                    d.kind == SymbolKind::Function && (d.start_line..=d.end_line).contains(&line)
+                })
+                .max_by_key(|d| d.start_line)
+                .map(|d| d.name.clone());
+            file.call_sites.push(ast::CallSite {
+                callee: name.clone(),
+                line,
+                containing_function,
+            });
+        }
+    }
 }
 
 /// Errors from the pipeline.
@@ -927,6 +999,50 @@ export function handler() {
         let paths: Vec<&str> = parsed.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/a.ts"));
         assert!(paths.contains(&"src/b.ts"));
+    }
+
+    #[test]
+    fn parse_files_parallel_links_python_to_sql_routines() {
+        let files = vec![
+            (
+                "app/handlers.py",
+                r#"from sqlalchemy import func, text
+
+HANDLERS = {"x": func.wms.do_x}
+
+def adjust(session):
+    session.execute(text("select wms.do_y(:q)"))
+
+def scan(session):
+    return session.scalar(func.wms.do_x_extra())
+"#,
+            ),
+            (
+                "db/do_x.sql",
+                "CREATE FUNCTION wms.do_x() RETURNS VOID AS $$ BEGIN PERFORM wms.do_y(1); END $$ LANGUAGE plpgsql;",
+            ),
+            (
+                "db/do_y.sql",
+                "CREATE FUNCTION wms.do_y(q INT) RETURNS VOID AS $$ BEGIN END $$ LANGUAGE plpgsql;",
+            ),
+        ];
+        let graph = crate::graph::SymbolGraph::build(&parse_files_parallel(&files));
+        let mut edges: Vec<(&str, &str)> = graph
+            .edges()
+            .into_iter()
+            .filter(|(_, to, _)| to.ends_with(".sql") || to.contains(".sql::"))
+            .map(|(from, to, _)| (from, to))
+            .collect();
+        edges.sort();
+        // `do_x_extra` is not defined, and must not match `do_x` by prefix.
+        assert_eq!(
+            edges,
+            vec![
+                ("app/handlers.py", "db/do_x.sql::do_x"),
+                ("app/handlers.py::adjust", "db/do_y.sql::do_y"),
+                ("db/do_x.sql::do_x", "db/do_y.sql::do_y"),
+            ]
+        );
     }
 
     #[test]
