@@ -36,6 +36,8 @@ const DiffViewer = forwardRef<DiffViewerHandle, DiffViewerProps>(function DiffVi
   const handleEditorMount = useCallback(
     (editor: any) => {
       editorRef.current = editor;
+      // Unchanged regions otherwise open fully expanded; fold them each time a new diff lands.
+      editor.onDidUpdateDiff(() => editor.collapseAllUnchangedRegions?.());
 
       // Get the modified editor (right side of the diff)
       const modifiedEditor = editor.getModifiedEditor();
@@ -46,7 +48,6 @@ const DiffViewer = forwardRef<DiffViewerHandle, DiffViewerProps>(function DiffVi
       const subEditorOpts = {
         glyphMargin: true,
         overviewRulerBorder: false,
-        overviewRulerLanes: 0,
         hideCursorInOverviewRuler: true,
         scrollbar: { verticalScrollbarSize: 4, horizontalScrollbarSize: 4 },
       };
@@ -212,9 +213,9 @@ const DiffViewer = forwardRef<DiffViewerHandle, DiffViewerProps>(function DiffVi
             horizontalScrollbarSize: 4,
           },
           overviewRulerBorder: false,
-          overviewRulerLanes: 0,
           hideCursorInOverviewRuler: true,
-          renderOverviewRuler: false,
+          // GitHub-style: fold unchanged code, keep a few context lines; folds expand inline.
+          hideUnchangedRegions: { enabled: true, contextLineCount: 3, minimumLineCount: 5, revealLineCount: 20 },
         }}
         beforeMount={(monaco) => {
           // Expose the monaco namespace so the global keyboard handler in App.tsx
