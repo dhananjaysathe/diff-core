@@ -96,6 +96,9 @@ function isPrUrl(value: string): boolean {
   return /^https?:\/\//i.test(value.trim());
 }
 
+/** `/?pr=<PR/MR URL>` deep link: open and analyze that PR on load. */
+const DEEP_LINK_PR = new URLSearchParams(window.location.search).get("pr")?.trim() || null;
+
 const SESSION_KEY = "diffcore.session";
 const JOBS_KEY = "diffcore.jobs";
 type StoredSession = {
@@ -313,8 +316,9 @@ export default function App() {
     typeof session?.repoPath === "string"
     && !!session.repoPath
     && !isPrUrl(session.repoPath)
-    && session.defaultRepo === DEFAULT_REPO;
-  const initialRepo = HAS_BACKEND ? (DEFAULT_REPO ?? "") : "/demo/repo";
+    && session.defaultRepo === DEFAULT_REPO
+    && !DEEP_LINK_PR;
+  const initialRepo = DEEP_LINK_PR ?? (HAS_BACKEND ? (DEFAULT_REPO ?? "") : "/demo/repo");
   const [repoPath, setRepoPath] = useState(restored ? session.repoPath : initialRepo);
   const [baseRef, setBaseRef] = useState(restored ? session.baseRef : "main");
   const [headRef, setHeadRef] = useState<string | null>(restored ? session.headRef : null);
@@ -1252,6 +1256,13 @@ export default function App() {
     runAnalysis();
   }, [pendingAnalysis, runAnalysis]);
 
+  const deepLinked = useRef(false);
+  useEffect(() => {
+    if (!DEEP_LINK_PR || deepLinked.current) return;
+    deepLinked.current = true;
+    submitRepoInput();
+  }, [submitRepoInput]);
+
   const recommendedSubscriptionProvider: SubscriptionProvider | null = llmSettings?.codex_authenticated
     ? "codex"
     : llmSettings?.claude_authenticated
@@ -1578,7 +1589,7 @@ export default function App() {
 
   // Auto-load demo data when not in Tauri
   useEffect(() => {
-    if (!HAS_BACKEND && !demoLoaded.current) {
+    if (!HAS_BACKEND && !DEEP_LINK_PR && !demoLoaded.current) {
       demoLoaded.current = true;
       runAnalysis();
     }

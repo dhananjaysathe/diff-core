@@ -88,6 +88,14 @@ test.describe("PR/MR URL in the repository field", () => {
     await expect(page.locator(".error-bar")).toHaveCount(0);
   });
 
+  test("?pr= deep link resolves and analyzes the PR on load", async ({ page }) => {
+    await page.goto(`/?pr=${encodeURIComponent(PR_URL)}`);
+    await expect(page.locator(".repo-input")).toHaveValue(RESOLVED_PATH);
+    await waitForAnalysis(page);
+    await expect(page.locator('[data-testid="base-branch-dropdown"] .branch-name')).toHaveText(RESOLVED_BASE);
+    await expect(page.locator('[data-testid="head-branch-dropdown"] .branch-name')).toHaveText(RESOLVED_HEAD);
+  });
+
   test("editing the field by hand restores branch auto-detection", async ({ page }) => {
     await submitRepoUrl(page, PR_URL);
     await expect(page.locator(".repo-input")).toHaveValue(RESOLVED_PATH);
