@@ -911,10 +911,14 @@ fn read_delta_content(repo: &Repository, oid: Oid, path: Option<&str>) -> Option
         .or_else(|| path.and_then(|path| read_workdir_content(repo, Path::new(path))))
 }
 
+/// Every workdir diff ends here, so this is also where diffcore's own state
+/// (`<repo>/.diffcore/`: IR and analysis caches, comments) is dropped. Left in,
+/// each run's new cache file shows up as a change in the next run.
 fn append_untracked_workdir_files(
     repo: &Repository,
     files: &mut Vec<FileDiff>,
 ) -> Result<(), GitError> {
+    files.retain(|file| !file.path().starts_with(".diffcore/"));
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true);
     opts.recurse_untracked_dirs(true);
@@ -928,7 +932,7 @@ fn append_untracked_workdir_files(
         let Some(path) = entry.path() else {
             continue;
         };
-        if files.iter().any(|file| file.path() == path) {
+        if path.starts_with(".diffcore/") || files.iter().any(|file| file.path() == path) {
             continue;
         }
         if is_workdir_file_binary(repo, Path::new(path)) {
@@ -1220,6 +1224,9 @@ mod tests {
         fs::write(dir.path().join("unstaged.ts"), "v2-unstaged").unwrap();
         fs::write(dir.path().join("mixed.ts"), "v2-staged").unwrap();
         fs::write(dir.path().join("untracked.ts"), "v1-untracked").unwrap();
+        // diffcore's own cache is never a change.
+        fs::create_dir_all(dir.path().join(".diffcore/cache")).unwrap();
+        fs::write(dir.path().join(".diffcore/cache/key.json"), "{}").unwrap();
 
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("staged.ts")).unwrap();
